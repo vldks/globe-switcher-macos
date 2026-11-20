@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Local build & runtime state
+globe-switcher
+.original_fn_usage_type
