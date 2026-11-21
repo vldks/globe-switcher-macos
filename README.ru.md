@@ -40,10 +40,10 @@
 | :---: | :---: | :---: |
 | ![Выбор языка](screenshots/ru/02-language-selector-v2.webp) | ![Меню действий](screenshots/ru/03-action-menu-ru.webp) | ![Статус](screenshots/ru/05-enabled-status-ru.webp) |
 
-Бинарник внутри команды собран из [`GlobeSwitcher.swift`](GlobeSwitcher.swift) (`swiftc -O -parse-as-library`, затем `strip -x`). SHA-256 до локальной ad-hoc подписи:
+Бинарник внутри команды собран из [`GlobeSwitcher.swift`](GlobeSwitcher.swift) (`swiftc -O -parse-as-library -target arm64-apple-macos13.0`, затем `strip -x`). SHA-256 до локальной ad-hoc подписи:
 
 ```text
-2015eb73f5a57648a765f403716528170f27445c331b3ec2cad4c2d363e57ee1  globe-switcher
+9314b5ac579fcf08e60c2215249b9f401bbc400d323852079d01368bb11a64cc  globe-switcher
 ```
 
 Если не хотите запускать готовый бинарник, соберите его сами.
@@ -51,8 +51,8 @@
 ## Сборка из исходников
 
 ```zsh
-# Нужны Xcode Command Line Tools
-swiftc -O -parse-as-library GlobeSwitcher.swift -o globe-switcher
+# Нужны Xcode Command Line Tools (Apple Silicon / arm64, macOS 13.0+)
+swiftc -O -parse-as-library -target arm64-apple-macos13.0 GlobeSwitcher.swift -o globe-switcher
 strip -x globe-switcher
 codesign -s - -f globe-switcher
 

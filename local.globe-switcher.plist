@@ -6,7 +6,7 @@
     <string>local.globe-switcher</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/vladkas/.gemini/antigravity/scratch/globe-switcher/globe-switcher</string>
+        <string>__BIN_PATH__</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

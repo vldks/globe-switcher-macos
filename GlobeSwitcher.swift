@@ -38,6 +38,7 @@ typealias SLPSGetKeyFocusProcessFunc = @convention(c) (
 @main
 struct GlobeSwitcher {
     static var globeDownTimestamp: TimeInterval = 0
+    static var globeDownUptime: TimeInterval = 0
     static var isGlobeCandidate = false
     static var activityToken: NSObjectProtocol?
     static var pendingSourceID: String?
@@ -66,6 +67,16 @@ struct GlobeSwitcher {
             case "--notify-fn-change":
                 let val = CFPreferencesGetAppIntegerValue("AppleFnUsageType" as CFString, "com.apple.HIToolbox" as CFString, nil)
                 TISUpdateFnUsageType(Int32(val))
+                return
+            case "--self-test":
+                InvalidateAllSelectedInputSourceState()
+                let sources = getSelectableInputSources()
+                if sources.count < 2 {
+                    fputs("ERROR: Less than 2 selectable keyboard input sources enabled (\(sources.count)).\n", stderr)
+                    exit(2)
+                }
+                _ = TISGetFnUsageType()
+                print("OK:\(sources.count)")
                 return
             default:
                 break
@@ -105,13 +116,18 @@ struct GlobeSwitcher {
                 return
             }
 
+            let nowUptime = ProcessInfo.processInfo.systemUptime
+
             if isGlobeDown && !hasOtherModifiers {
                 globeDownTimestamp = event.timestamp
+                globeDownUptime = nowUptime
                 isGlobeCandidate = true
             } else if !isGlobeDown && isGlobeCandidate {
                 isGlobeCandidate = false
-                let heldDuration = event.timestamp - globeDownTimestamp
-                let timeSinceGlobeDown = ProcessInfo.processInfo.systemUptime - globeDownTimestamp
+                let heldDuration = event.timestamp >= globeDownTimestamp
+                    ? (event.timestamp - globeDownTimestamp)
+                    : (nowUptime - globeDownUptime)
+                let timeSinceGlobeDown = max(0, nowUptime - globeDownUptime)
 
                 // Проверяем по единому монотонному таймеру WindowServer, нажимались ли
                 // клавиши (например, Delete для Forward Delete) или кнопки мыши ПОСЛЕ нажатия 🌐 Globe.
@@ -128,9 +144,9 @@ struct GlobeSwitcher {
                     eventType: .rightMouseDown
                 )
 
-                let clockSkewTolerance: TimeInterval = 0.002
-                if heldDuration > 0 &&
-                   heldDuration < 0.45 &&
+                let clockSkewTolerance: TimeInterval = 0.005
+                if heldDuration >= 0 &&
+                   heldDuration < 0.65 &&
                    sinceLastKeyDown + clockSkewTolerance >= timeSinceGlobeDown &&
                    sinceLastLeftClick + clockSkewTolerance >= timeSinceGlobeDown &&
                    sinceLastRightClick + clockSkewTolerance >= timeSinceGlobeDown {
@@ -146,11 +162,7 @@ struct GlobeSwitcher {
         app.run()
     }
 
-    static func selectNextInputSource() {
-        // Сбрасываем локальный кэш HIToolbox перед чтением текущего источника ввода,
-        // чтобы гарантированно прочитать актуальное состояние после внешних переключений (Caps Lock / строка меню).
-        InvalidateAllSelectedInputSourceState()
-
+    static func getSelectableInputSources() -> [TISInputSource] {
         let filter: CFDictionary = [
             kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String,
             kTISPropertyInputSourceIsSelectCapable as String: true,
@@ -159,28 +171,36 @@ struct GlobeSwitcher {
 
         guard let listRef = TISCreateInputSourceList(filter, false)?.takeRetainedValue(),
               let allSources = listRef as? [TISInputSource] else {
-            return
+            return []
         }
 
         // Оставляем только раскладки клавиатуры и основные режимы ввода (исключаем палитры эмодзи/символов)
-        let selectableSources = allSources.filter { source in
+        return allSources.filter { source in
             let type = inputSourceProperty(source, kTISPropertyInputSourceType)
             return type == (kTISTypeKeyboardLayout as String) ||
                    type == (kTISTypeKeyboardInputMethodWithoutModes as String) ||
                    type == (kTISTypeKeyboardInputMode as String)
         }
+    }
 
+    static func selectNextInputSource() {
+        // Сбрасываем локальный кэш HIToolbox перед чтением текущего источника ввода,
+        // чтобы гарантированно прочитать актуальное состояние после внешних переключений (Caps Lock / строка меню).
+        InvalidateAllSelectedInputSourceState()
+
+        let selectableSources = getSelectableInputSources()
         guard selectableSources.count > 1,
               let currentRef = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else {
             return
         }
 
         let now = ProcessInfo.processInfo.systemUptime
+        let actualCurrentID = inputSourceProperty(currentRef, kTISPropertyInputSourceID)
         let currentID: String
         if let pending = pendingSourceID, now - pendingSourceTimestamp < 0.25 {
             currentID = pending
         } else {
-            currentID = inputSourceProperty(currentRef, kTISPropertyInputSourceID)
+            currentID = actualCurrentID
         }
 
         let nextSource: TISInputSource
@@ -195,20 +215,17 @@ struct GlobeSwitcher {
         pendingSourceTimestamp = now
 
         // Делегируем переключение напрямую активному процессу с клавиатурным фокусом (KeyFocus Process)
-        // через его Mach-порт com.apple.tsm.portname (сообщение kTSMMessageSetInputSourceSelected = 7),
-        // как это делает системный TextInputMenuAgent.
-        // Вызов TISSelectInputSource из фонового процесса-демона сначала перезаписывает CFPreferences,
-        // из-за чего в целевом приложении возникает состояние гонки (IPC race condition) между Mach-сообщением 7
-        // и асинхронным уведомлением distnoted ('issc'): целевое приложение видит, что новая раскладка уже
-        // помечена выбранной в CFPreferences, пропускает инвалидацию локального кэша gCurrentSelectedInputSource,
-        // и плавающий индикатор у текстового курсора (ShowSourceIndicator) отрисовывает предыдущий (противоположный) язык.
-        if !selectInputSourceInKeyFocusProcess(nextSource) {
+        // через его Mach-порт com.apple.tsm.portname (сообщение kTSMMessageSetInputSourceSelected = 7).
+        // Если целевой процесс не обработал сообщение или раскладка фактически не изменилась
+        // (например, на Рабочем столе / в процессе без активного TSM-контекста на macOS 26),
+        // автоматически выполняем прямой TISSelectInputSource(nextSource).
+        if !selectInputSourceInKeyFocusProcess(nextSource, targetID: nextID) {
             pendingSourceID = nil
             TISSelectInputSource(nextSource)
         }
     }
 
-    static func selectInputSourceInKeyFocusProcess(_ source: TISInputSource) -> Bool {
+    static func selectInputSourceInKeyFocusProcess(_ source: TISInputSource, targetID: String) -> Bool {
         guard let pid = keyFocusProcessPID(), pid > 0, pid != getpid() else {
             return false
         }
@@ -241,9 +258,38 @@ struct GlobeSwitcher {
             return false
         }
 
-        let status = CFMessagePortSendRequest(port, 7, data, 0.0, 0.0, nil, nil)
+        var returnDataUnmanaged: Unmanaged<CFData>?
+        let status = CFMessagePortSendRequest(
+            port,
+            7,
+            data,
+            0.05,
+            0.05,
+            CFRunLoopMode.defaultMode.rawValue,
+            &returnDataUnmanaged
+        )
         CFMessagePortInvalidate(port)
-        return status == kCFMessagePortSuccess
+
+        guard status == kCFMessagePortSuccess else {
+            return false
+        }
+
+        if let replyData = returnDataUnmanaged?.takeRetainedValue(),
+           let replyDict = CFPropertyListCreateWithData(kCFAllocatorDefault, replyData, 0, nil, nil)?.takeRetainedValue() as? [String: Any],
+           let errCode = replyDict["tsmMessageResultErrorKey"] as? Int,
+           errCode != 0 {
+            return false
+        }
+
+        InvalidateAllSelectedInputSourceState()
+        if let updatedRef = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() {
+            let updatedID = inputSourceProperty(updatedRef, kTISPropertyInputSourceID)
+            if updatedID == targetID {
+                return true
+            }
+        }
+
+        return false
     }
 
     static func keyFocusProcessPID() -> pid_t? {
